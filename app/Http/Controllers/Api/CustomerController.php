@@ -11,7 +11,6 @@ use Lcobucci\JWT\Signer\Hmac\Sha256;
 use Lcobucci\JWT\Signer\Key\InMemory;
 use Lcobucci\JWT\Validation\Constraint\SignedWith;
 use Lcobucci\JWT\Validation\Constraint\ValidAt;
-use Lcobucci\JWT\Validation\Constraint\PermittedFor;
 use Lcobucci\Clock\SystemClock;
 use DateTimeImmutable;
 use DateTimeZone;
@@ -36,6 +35,10 @@ class CustomerController extends Controller
             }
 
             $tokenString = substr($authHeader, 7);
+
+            // Debug logging
+            Log::info('Secret Key Used: ' . $this->secretKey);
+            Log::info('Token Received: ' . $tokenString);
 
             // 2. Konfigurasi JWT
             $config = Configuration::forSymmetricSigner(
@@ -74,54 +77,63 @@ class CustomerController extends Controller
             $nameCustomers = $request->input('name_customers');
             $dateRequest = $request->input('date_request');
 
-            // 6. Logic discount sesuai ketentuan
-            $discounts = [
-                ['min' => 0, 'max' => 50000, 'discount' => 0.02],
-                ['min' => 50000, 'max' => 150000, 'discount' => 0.035],
-                ['min' => 150000, 'max' => PHP_INT_MAX, 'discount' => 0.05]
-            ];
+            // 6. Query data dari database dengan perhitungan discount yang benar
+            $results = DB::select("
+                SELECT
+                    u.name as name_customers,
+                    m.items,
+                    m.estimate_price,
+                    -- Hitung discount rate berdasarkan rules
+                    CASE
+                        WHEN m.estimate_price < 50000 THEN 0.02
+                        WHEN m.estimate_price >= 50000 AND m.estimate_price <= 1500000 THEN 0.035
+                        ELSE 0.05
+                    END as discount_rate,
+                    -- Hitung fix price dengan discount
+                    ROUND(
+                        m.estimate_price - (m.estimate_price *
+                            CASE
+                                WHEN m.estimate_price < 50000 THEN 0.02
+                                WHEN m.estimate_price >= 50000 AND m.estimate_price <= 1500000 THEN 0.035
+                                ELSE 0.05
+                            END
+                        ),
+                    0) as fix_price
+                FROM user u
+                INNER JOIN master_items m ON u.id = m.id_name
+                WHERE u.name = ?
+                ORDER BY m.id
+            ", [$nameCustomers]);
 
-            // 7. Data contoh sesuai requirement
-            // Dalam implementasi real, data ini akan dari database
-            $exampleData = [
-                [
-                    'name_customers' => $nameCustomers,
-                    'items' => 'Lampu bohlam LED 20 WATT',
-                    'estimate_price' => 20000,
-                ],
-                [
-                    'name_customers' => $nameCustomers,
-                    'items' => 'Mouse wireless logitech',
-                    'estimate_price' => 180000,
-                ]
-            ];
+            // 7. Format hasil sesuai requirement (data original dari DB)
+            $formattedResults = [];
 
-            // 8. Hitung discount dan fix price
-            $results = [];
-            foreach ($exampleData as $item) {
-                $price = $item['estimate_price'];
-                $discount = 0;
-
-                foreach ($discounts as $discRule) {
-                    if ($price >= $discRule['min'] && $price < $discRule['max']) {
-                        $discount = $discRule['discount'];
-                        break;
-                    }
-                }
-
-                $fixPrice = $price - ($price * $discount);
-
-                $results[] = [
-                    'name_customers' => $item['name_customers'],
-                    'items' => $item['items'],
-                    'dicount' => number_format($discount, 3, ',', ''),
-                    'fix_price' => number_format($fixPrice, 0, ',', '')
+            foreach ($results as $item) {
+                $formattedResults[] = [
+                    'name_customers' => $item->name_customers,
+                    'items' => $item->items,
+                    'dicount' => number_format($item->discount_rate, 3, ',', ''),
+                    'fix_price' => number_format($item->fix_price, 0, ',', '')
                 ];
             }
 
-            // 9. Return response sesuai format requirement
+            // 8. Log hasil query untuk debugging
+            Log::info('Query results for ' . $nameCustomers . ': ', $results);
+
+            // 9. Jika tidak ada data di database, return error atau empty array
+            if (empty($formattedResults)) {
+                Log::warning('No data found in database for customer: ' . $nameCustomers);
+                return response()->json([
+                    'result' => [],
+                    'message' => 'No items found for this customer'
+                ], 200);
+            }
+
+            // 10. Return response sesuai format requirement
+            Log::info('Returning response for customer: ' . $nameCustomers);
+
             return response()->json([
-                'result' => $results
+                'result' => $formattedResults
             ], 200);
 
         } catch (\Illuminate\Validation\ValidationException $e) {
@@ -133,7 +145,7 @@ class CustomerController extends Controller
             Log::error('Error in getCustomerItems: ' . $e->getMessage());
             Log::error('Stack trace: ' . $e->getTraceAsString());
             return response()->json([
-                'error' => 'Internal server error'
+                'error' => 'Internal server error: ' . $e->getMessage()
             ], 500);
         }
     }
